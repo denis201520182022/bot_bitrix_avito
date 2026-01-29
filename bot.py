@@ -34,14 +34,23 @@ logging.basicConfig(
 app = FastAPI()
 redis_client = None
 
-async def get_redis():
+async def get_redis(force_reconnect=False):
     global redis_client
+    if force_reconnect and redis_client:
+        try:
+            await redis_client.close()
+        except Exception:
+            pass
+        redis_client = None
+
     if redis_client is None:
         redis_client = aioredis.Redis(
             host=config.REDIS_HOST,
             port=int(config.REDIS_PORT),
             db=0,
-            decode_responses=True
+            decode_responses=True,
+            socket_timeout=5.0,        # Таймаут на операции
+            socket_connect_timeout=5.0 # Таймаут на подключение
         )
     return redis_client
 
@@ -394,24 +403,43 @@ async def bot_handler(
         if not dialog_id:
             logging.error("Нет dialog_id в запросе")
             return JSONResponse({"status": "error", "message": "Missing dialog_id"}, status_code=400)
-        
-        r = await get_redis()
-        
-        # Получаем текущие значения лимитов
-        chat_limit = int(await r.get("chat_limit") or 0)
-        chat_count = int(await r.get("chat_count") or 0)
-        
-        logging.info(f"[Диалог {dialog_id}] Текущий лимит: {chat_limit}, использовано: {chat_count}")
+        if not user_message and event == "ONIMBOTJOINCHAT":
+             logging.info(f"[Диалог {dialog_id}] Вход в чат без сообщения. Игнорируем.")
+             return JSONResponse({"status": "ignored", "message": "Join event without message"})
+        # --- ИСПРАВЛЕНИЕ 2: RETRY LOGIC для Redis ---
+        max_retries = 3
+        chat_limit = 0
+        chat_count = 0
+        r = None
 
-        # Проверяем: это новый диалог?
-        is_new_chat = await r.sadd("counted_dialogs", dialog_id)
-        
-        if is_new_chat:  # Redis вернет 1, если dialog_id добавлен впервые
-            chat_count += 1
-            await r.set("chat_count", chat_count)
-            logging.info(f"[Диалог {dialog_id}] Новый диалог! Обновили счетчик: {chat_count}")
-        else:
-            logging.info(f"[Диалог {dialog_id}] Существующий диалог, счетчик не изменяется")
+        for attempt in range(max_retries):
+            try:
+                # При повторных попытках принудительно пересоздаем соединение
+                force_reset = (attempt > 0)
+                r = await get_redis(force_reconnect=force_reset)
+                
+                # Попытка выполнить операции с Redis
+                chat_limit = int(await r.get("chat_limit") or 0)
+                chat_count = int(await r.get("chat_count") or 0)
+                
+                # Проверяем: это новый диалог?
+                is_new_chat = await r.sadd("counted_dialogs", dialog_id)
+                if is_new_chat:
+                    chat_count += 1
+                    await r.set("chat_count", chat_count)
+                    logging.info(f"[Диалог {dialog_id}] Новый диалог! Обновили счетчик: {chat_count}")
+                else:
+                    logging.info(f"[Диалог {dialog_id}] Существующий диалог, счетчик не изменяется")
+                
+                # Если дошли сюда без ошибок - выходим из цикла retry
+                break 
+
+            except (aioredis.ConnectionError, OSError, RuntimeError) as redis_err:
+                logging.warning(f"[Redis Retry] Попытка {attempt+1}/{max_retries} не удалась: {redis_err}")
+                if attempt == max_retries - 1:
+                    logging.error("Redis недоступен после всех попыток.")
+                    return JSONResponse({"status": "error", "message": "Redis unavailable"}, status_code=500)
+                await asyncio.sleep(0.2) # Небольшая пауза перед повтором
 
         # ГЛАВНАЯ ПРОВЕРКА: если установлен лимит и он превышен
         if chat_limit > 0 and chat_count > chat_limit:
@@ -446,17 +474,27 @@ async def bot_handler(
                 else:
                     logging.info(f"[Диалог {dialog_id}] Отложенный перевод уже запланирован. Пропускаем.")
         
-        # Обработка обычных сообщений через GPT
-        await r.rpush(f"pending:{dialog_id}", user_message.strip())
-        await ensure_worker_running(dialog_id, user_name or "клиент")
+
+
+        # --- ИСПРАВЛЕНИЕ 3: Безопасная работа с сообщением и очередью ---
+        if user_message and user_message.strip():
+            # Здесь тоже используем retry механизм (в рамках той же сессии r, но если она упадет, воркер подхватит)
+            try:
+                await r.rpush(f"pending:{dialog_id}", user_message.strip())
+                await ensure_worker_running(dialog_id, user_name or "клиент")
+            except Exception as e:
+                logging.error(f"[Диалог {dialog_id}] Ошибка добавления в Redis: {e}")
+                # Тут можно попытаться еще раз реконнектнуть, но для простоты вернем 500, чтобы Битрикс повторил вебхук
+                return JSONResponse({"status": "error", "message": "Failed to queue message"}, status_code=500)
+        else:
+            logging.info(f"[Диалог {dialog_id}] Сообщение пустое или None, пропускаем обработку GPT.")
 
         return JSONResponse({
             "status": "queued", 
-            "message": "Сообщение добавлено в очередь на обработку",
+            "message": "Сообщение добавлено в очередь",
             "limits": {
                 "current_limit": chat_limit,
-                "used": chat_count,
-                "remaining": max(0, chat_limit - chat_count) if chat_limit > 0 else "unlimited"
+                "used": chat_count
             }
         })
         
