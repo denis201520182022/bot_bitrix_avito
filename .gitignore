@@ -12,3 +12,4 @@ config.py
 check_openai_key.py
 logs/
 temp/
+prompt.txt
